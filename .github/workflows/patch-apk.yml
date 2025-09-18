@@ -1,0 +1,146 @@
+name: Patch APK (replace backend URL)
+
+on:
+  workflow_dispatch:
+    inputs:
+      NEW_BASE_URL:
+        description: "Nueva URL del backend (debe terminar en /, ej: https://mi-backend.tld/)"
+        required: true
+      OLD_BASE_URL:
+        description: "URL vieja a reemplazar (opcional, mejora la precisión)"
+        required: false
+      APK_PATH:
+        description: "Ruta del APK dentro del repo"
+        default: "app-debug.apk"
+        required: true
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validar APK
+        run: |
+          set -e
+          test -f "${{ github.event.inputs.APK_PATH }}" || { echo "❌ No existe ${{ github.event.inputs.APK_PATH }} en el repo"; exit 1; }
+          ls -lh "${{ github.event.inputs.APK_PATH }}"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Descargar apktool y uber-apk-signer
+        run: |
+          set -e
+          APKTOOL_VER=2.9.3
+          UBER_VER=1.3.0
+          curl -L -o apktool.jar "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VER}/apktool_${APKTOOL_VER}.jar"
+          curl -L -o uber-apk-signer.jar "https://github.com/patrickfav/uber-apk-signer/releases/download/v${UBER_VER}/uber-apk-signer-${UBER_VER}.jar"
+
+      - name: Decompilar APK
+        run: |
+          set -e
+          mkdir -p work
+          cp "${{ github.event.inputs.APK_PATH }}" work/app.apk
+          cd work
+          java -jar ../apktool.jar d app.apk -o app_mod -f
+
+      - name: Normalizar NEW_BASE_URL
+        id: norm
+        run: |
+          NEW="${{ github.event.inputs.NEW_BASE_URL }}"
+          # asegurar slash final
+          case "$NEW" in
+            */) echo "NEW=$NEW" ;;
+            *)  NEW="${NEW}/" ;;
+          esac
+          echo "NEW=$NEW" >> $GITHUB_OUTPUT
+          echo "➡️ NEW_BASE_URL normalizada: $NEW"
+
+      - name: Reemplazar URL en resources (strings.xml)
+        id: replace_res
+        run: |
+          set -e
+          cd work/app_mod
+          NEW="${{ steps.norm.outputs.NEW }}"
+          OLD="${{ github.event.inputs.OLD_BASE_URL }}"
+          FILE="res/values/strings.xml"
+
+          touched="false"
+          if [ -f "$FILE" ]; then
+            if [ -n "$OLD" ]; then
+              grep -Rin -- "$OLD" "$FILE" && sed -i "s|$OLD|$NEW|g" "$FILE" || true
+            fi
+            # Reemplazo genérico de URLs http(s) si no se dio OLD
+            sed -i 's|https\?://[^"<]*|'"$NEW"'|g' "$FILE" || true
+            # WebSocket también
+            sed -i 's|wss\?://[^"<]*|'"${NEW/http/wss}"'|g' "$FILE" || true
+
+            grep -Rin -- "$NEW" "$FILE" >/dev/null 2>&1 && touched="true"
+          fi
+
+          echo "found_res=$touched" >> $GITHUB_OUTPUT
+          if [ "$touched" = "true" ]; then
+            echo "✅ URL reemplazada en strings.xml"
+          else
+            echo "ℹ️ No se encontró URL en strings.xml"
+          fi
+
+      - name: Reemplazar URL en smali (naive/dirigido)
+        if: steps.replace_res.outputs.found_res != 'true'
+        run: |
+          set -e
+          cd work/app_mod
+          NEW="${{ steps.norm.outputs.NEW }}"
+          OLD="${{ github.event.inputs.OLD_BASE_URL }}"
+
+          echo "🔎 Buscando URLs en smali..."
+          MATCHES=$(grep -Rin --include='*.smali' -E '"https?://[^"]+"' smali* | head -n 100 || true)
+          echo "$MATCHES"
+
+          if [ -n "$OLD" ]; then
+            # Reemplazo dirigido (si sabemos la vieja)
+            grep -Ril --include='*.smali' -F "$OLD" smali* | xargs -r sed -i "s|$OLD|$NEW|g"
+            # WebSocket viejo -> nuevo (si aplica)
+            OLD_WS=$(echo "$OLD" | sed 's|^http|ws|')
+            NEW_WS=$(echo "$NEW" | sed 's|^http|ws|')
+            grep -Ril --include='*.smali' -F "$OLD_WS" smali* | xargs -r sed -i "s|$OLD_WS|$NEW_WS|g"
+          else
+            # Sin OLD: tomar primeras coincidencias y reemplazarlas por la NEW
+            FIRST_FILE=$(echo "$MATCHES" | head -n1 | cut -d: -f1)
+            FIRST_URL=$(echo "$MATCHES" | head -n1 | sed -E 's/^[^"]*"((https?:\/\/)[^"]+)".*$/\1/')
+            if echo "$FIRST_URL" | grep -E '^https?://'; then
+              sed -i "s|$FIRST_URL|$NEW|g" "$FIRST_FILE"
+              # Equivalent WS
+              sed -i "s|${FIRST_URL/http/ws}|${NEW/http/ws}|g" "$FIRST_FILE" || true
+              echo "🛠️ Reemplazo naive en $FIRST_FILE"
+            else
+              echo "⚠️ No pude extraer una URL válida para reemplazo naive"
+            fi
+          fi
+
+      - name: Reconstruir APK
+        run: |
+          set -e
+          cd work
+          java -jar ../apktool.jar b app_mod -o app_patched_unsigned.apk
+          ls -lh app_patched_unsigned.apk
+
+      - name: Firmar APK (debug)
+        run: |
+          set -e
+          cd work
+          java -jar ../uber-apk-signer.jar --allowResign -a app_patched_unsigned.apk --out ./
+          ls -lh *signed.apk || { echo "❌ No se generó APK firmado"; exit 1; }
+          mv *signed.apk app-debug-patched-signed.apk
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-patched-signed
+          path: work/app-debug-patched-signed.apk
+          if-no-files-found: error
