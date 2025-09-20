@@ -1,120 +1,47 @@
-name: Patch APK (replace backend URL)
+name: Unzip y guardar en main
 
 on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'client.zip'
+      - '.github/workflows/**'
   workflow_dispatch:
-    inputs:
-      NEW_BASE_URL:
-        description: "Nueva URL del backend (debe terminar en /, ej: https://mi-backend.tld/)"
-        required: true
-      OLD_BASE_URL:
-        description: "URL vieja a reemplazar (opcional, mejora la precisión)"
-        required: false
-      APK_PATH:
-        description: "Ruta del APK dentro del repo"
-        default: "app-debug.apk"
-        required: true
+
+permissions:
+  contents: write   # necesario para hacer push
 
 jobs:
-  patch:
+  unzip:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Validar APK
-        run: |
-          set -e
-          test -f "${{ github.event.inputs.APK_PATH }}" || { echo "❌ No existe ${{ github.event.inputs.APK_PATH }} en el repo"; exit 1; }
-          ls -lh "${{ github.event.inputs.APK_PATH }}"
-
-      - name: Set up Java
-        uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: "17"
+          fetch-depth: 0
 
-      - name: Descargar apktool y uber-apk-signer
+      - name: Verificar q.zip en la raíz
+        run: |
+          ls -la
+          test -f q.zip || { echo "❌ No está q.zip en la raíz"; exit 1; }
+
+      - name: Unzip q.zip y mover a la raíz
+        run: |
+          set -euo pipefail
+          rm -rf extracted
+          unzip -o q.zip -d extracted
+          ROOT_DIR=$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n1 || echo "extracted")
+          shopt -s dotglob
+          rsync -a "$ROOT_DIR"/ .
+          rm -rf extracted q.zip
+          echo "📦 Contenido final:"
+          ls -la
+
+      - name: Commit & push a main
         run: |
           set -e
-          APKTOOL_VER=2.9.3
-          UBER_VER=1.3.0
-          curl -L -o apktool.jar "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VER}/apktool_${APKTOOL_VER}.jar"
-          curl -L -o uber-apk-signer.jar "https://github.com/patrickfav/uber-apk-signer/releases/download/v${UBER_VER}/uber-apk-signer-${UBER_VER}.jar"
-
-      - name: Decompilar APK
-        run: |
-          set -e
-          mkdir -p work
-          cp "${{ github.event.inputs.APK_PATH }}" work/app.apk
-          cd work
-          java -jar ../apktool.jar d app.apk -o app_mod -f
-
-      - name: Normalizar NEW_BASE_URL
-        id: norm
-        run: |
-          NEW="${{ github.event.inputs.NEW_BASE_URL }}"
-          case "$NEW" in */) ;; *) NEW="${NEW}/" ;; esac
-          echo "NEW=$NEW" >> $GITHUB_OUTPUT
-          echo "➡️ NEW_BASE_URL: $NEW"
-
-      - name: Reemplazar URL en resources (strings.xml)
-        id: replace_res
-        run: |
-          set -e
-          cd work/app_mod
-          NEW="${{ steps.norm.outputs.NEW }}"
-          OLD="${{ github.event.inputs.OLD_BASE_URL }}"
-          FILE="res/values/strings.xml"
-          touched="false"
-          if [ -f "$FILE" ]; then
-            [ -n "$OLD" ] && { grep -Rin -- "$OLD" "$FILE" && sed -i "s|$OLD|$NEW|g" "$FILE" || true; }
-            sed -i 's|https\?://[^"<]*|'"$NEW"'|g' "$FILE" || true
-            sed -i 's|wss\?://[^"<]*|'"${NEW/http/wss}"'|g' "$FILE" || true
-            grep -Rin -- "$NEW" "$FILE" >/dev/null 2>&1 && touched="true"
-          fi
-          echo "found_res=$touched" >> $GITHUB_OUTPUT
-
-      - name: Reemplazar URL en smali (naive/dirigido)
-        if: steps.replace_res.outputs.found_res != 'true'
-        run: |
-          set -e
-          cd work/app_mod
-          NEW="${{ steps.norm.outputs.NEW }}"
-          OLD="${{ github.event.inputs.OLD_BASE_URL }}"
-          MATCHES=$(grep -Rin --include='*.smali' -E '"https?://[^"]+"' smali* | head -n 100 || true)
-          echo "$MATCHES"
-          if [ -n "$OLD" ]; then
-            grep -Ril --include='*.smali' -F "$OLD" smali* | xargs -r sed -i "s|$OLD|$NEW|g"
-            OLD_WS=$(echo "$OLD" | sed 's|^http|ws|'); NEW_WS=$(echo "$NEW" | sed 's|^http|ws|')
-            grep -Ril --include='*.smali' -F "$OLD_WS" smali* | xargs -r sed -i "s|$OLD_WS|$NEW_WS|g"
-          else
-            FIRST_FILE=$(echo "$MATCHES" | head -n1 | cut -d: -f1)
-            FIRST_URL=$(echo "$MATCHES" | head -n1 | sed -E 's/^[^"]*"((https?:\/\/)[^"]+)".*$/\1/')
-            if echo "$FIRST_URL" | grep -E '^https?://'; then
-              sed -i "s|$FIRST_URL|$NEW|g" "$FIRST_FILE"
-              sed -i "s|${FIRST_URL/http/ws}|${NEW/http/ws}|g" "$FIRST_FILE" || true
-            fi
-          fi
-
-      - name: Reconstruir APK
-        run: |
-          set -e
-          cd work
-          java -jar ../apktool.jar b app_mod -o app_patched_unsigned.apk
-          ls -lh app_patched_unsigned.apk
-
-      - name: Firmar APK (debug) - skip verify/zipalign
-        run: |
-          set -e
-          cd work
-          java -jar ../uber-apk-signer.jar --allowResign --skipZipAlign --skipVerify \
-            -a app_patched_unsigned.apk --out ./
-          ls -lh *signed.apk || { echo "❌ No se generó APK firmado"; exit 1; }
-          mv *signed.apk app-debug-patched-signed.apk
-
-      - name: Subir artefacto
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-debug-patched-signed
-          path: work/app-debug-patched-signed.apk
-          if-no-files-found: error
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Unzip q.zip [skip ci]" || { echo "Nada para commitear"; exit 0; }
+          git push
