@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'client.zip'
+      - 'Barrilete.zip'
       - '.github/workflows/**'
   workflow_dispatch:
 
@@ -20,20 +20,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Verificar client.zip en la raíz
+      - name: Verificar Barrilete.zip en la raíz
         run: |
           ls -la
-          test -f client.zip || { echo "❌ No está client.zip en la raíz"; exit 1; }
+          test -f Barrilete.zip || { echo "❌ No está Barrilete.zip en la raíz"; exit 1; }
 
-      - name: Unzip client.zip y mover a la raíz
+      - name: Unzip Barrilete.zip y mover a la raíz
         run: |
           set -euo pipefail
           rm -rf extracted
-          unzip -o client.zip -d extracted
+          unzip -o Barrilete.zip -d extracted
           ROOT_DIR=$(find extracted -mindepth 1 -maxdepth 1 -type d | head -n1 || echo "extracted")
           shopt -s dotglob
           rsync -a "$ROOT_DIR"/ .
-          rm -rf extracted client.zip
+          rm -rf extracted Barrilete.zip
           echo "📦 Contenido final:"
           ls -la
 
